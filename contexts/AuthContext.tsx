@@ -1,5 +1,6 @@
 'use client';
 
+import { Buffer } from 'buffer';
 import {
   createContext,
   useContext,
@@ -189,20 +190,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!walletSelector) throw new Error('Wallet selector not initialized');
     if (!nearAccount) throw new Error('No wallet connected');
 
-    const message = `Sign in to Privy Finance\\nTimestamp: ${Date.now()}`;
+    const nonceBytes = new Uint8Array(32);
+    window.crypto.getRandomValues(nonceBytes);
+    const nonce = Buffer.from(nonceBytes);
+    const message = `Sign in to Privy Finance\nAccount: ${nearAccount.accountId}\nTimestamp: ${Date.now()}`;
+    const callbackUrl = typeof window !== 'undefined' ? window.location.href : undefined;
+    const recipient = typeof window !== 'undefined' ? window.location.host : nearAccount.accountId;
     const wallet = await walletSelector.wallet();
+
+    if (typeof (wallet as any).signMessage !== 'function') {
+      throw new Error('Selected wallet does not support message signing. Try MyNearWallet, HERE, or Meteor.');
+    }
 
     const signature = await (wallet as any).signMessage({
       message,
-      recipient: nearAccount.accountId,
+      recipient,
+      nonce,
+      callbackUrl,
     });
+
+    if (!signature) {
+      throw new Error('Wallet did not return a signature. Please retry and approve the signature request.');
+    }
+
+    const signedAccountId =
+      typeof (signature as any).accountId === 'string' && (signature as any).accountId.trim()
+        ? (signature as any).accountId.trim()
+        : nearAccount.accountId;
 
     const response = await fetch('/api/auth/wallet-signin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        accountId: nearAccount.accountId,
+        accountId: signedAccountId,
         message,
+        recipient,
+        callbackUrl,
+        nonce: nonce.toString('base64'),
         signature,
       }),
     });

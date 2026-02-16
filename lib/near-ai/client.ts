@@ -48,36 +48,99 @@ export interface ExtractedPDFTransaction {
   confidence?: number;
 }
 
+const NUMERIC_12_2_MAX_ABS = 9_999_999_999.99;
+const DEFAULT_MAX_TRANSACTION_ABS = 5_000_000;
+const RETIRED_NEAR_AI_HOST = 'api.near.ai';
+const CLOUD_NEAR_AI_BASE_URL = 'https://cloud-api.near.ai/v1';
+
 export class NEARAIService {
   private client: AxiosInstance;
+  private readonly apiKey: string;
 
   constructor() {
     const apiKey = process.env.NEAR_AI_API_KEY;
-    const endpoint = process.env.NEXT_PUBLIC_NEAR_AI_ENDPOINT;
+    const endpoint = this.resolveEndpoint(process.env.NEXT_PUBLIC_NEAR_AI_ENDPOINT);
 
     if (!apiKey || !endpoint) {
       throw new Error('NEAR AI configuration missing from environment variables');
     }
 
+    this.apiKey = apiKey;
     this.client = axios.create({
       baseURL: endpoint,
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
       timeout: 120_000,
     });
   }
 
+  private resolveEndpoint(rawEndpoint?: string) {
+    const fallback = CLOUD_NEAR_AI_BASE_URL;
+    const candidate = String(rawEndpoint || '').trim();
+    if (!candidate) return fallback;
+
+    try {
+      const url = new URL(candidate);
+      if (url.hostname === RETIRED_NEAR_AI_HOST) {
+        return fallback;
+      }
+
+      if (url.hostname === 'cloud.near.ai') {
+        return fallback;
+      }
+
+      return candidate.replace(/\/+$/, '');
+    } catch {
+      return fallback;
+    }
+  }
+
+  private switchToCloudEndpoint() {
+    const currentBase = String(this.client.defaults.baseURL || '').trim().replace(/\/+$/, '');
+    if (currentBase === CLOUD_NEAR_AI_BASE_URL) {
+      return;
+    }
+
+    this.client.defaults.baseURL = CLOUD_NEAR_AI_BASE_URL;
+    this.client.defaults.headers.common = {
+      ...(this.client.defaults.headers.common || {}),
+      Authorization: `Bearer ${this.apiKey}`,
+    };
+  }
+
   async createCompletion(request: NEARAIRequest): Promise<NEARAIResponse> {
-    const response = await this.client.post('/chat/completions', {
+    const payload = {
       model: request.model || 'deepseek-ai/DeepSeek-V3.1',
       messages: request.messages,
       max_tokens: request.max_tokens || 4000,
       temperature: request.temperature ?? 0.7,
       stream: false,
       tee_enabled: process.env.NEAR_AI_TEE_ENABLED !== 'false',
-    });
+    };
+
+    let response;
+
+    try {
+      response = await this.client.post('/chat/completions', payload);
+    } catch (error: any) {
+      const status = Number(error?.response?.status);
+      const responseDetail = String(error?.response?.data?.detail || '').toLowerCase();
+      const currentBase = String(this.client.defaults.baseURL || '').toLowerCase();
+      const looksRetired =
+        status === 410 ||
+        responseDetail.includes('retired') ||
+        currentBase.includes(RETIRED_NEAR_AI_HOST) ||
+        currentBase.includes('cloud.near.ai');
+
+      if (looksRetired) {
+        this.switchToCloudEndpoint();
+        response = await this.client.post('/chat/completions', payload);
+      } else {
+        throw error;
+      }
+    }
 
     const attestationId = response.headers['x-tee-attestation-id'];
     const attestationSignature = response.headers['x-tee-attestation-signature'];
@@ -247,45 +310,109 @@ export class NEARAIService {
       }))
       .filter((item) => item.chunk.length > 0);
 
-    const chunkConcurrency = this.getParallelism('NEAR_AI_PDF_CHUNK_CONCURRENCY', 6, 20);
-    const { output: chunkResults, errors: chunkErrors } = await this.runInBatches(
+    const chunkConcurrency = Math.min(
+      chunkItems.length,
+      this.getParallelism('NEAR_AI_PDF_CHUNK_CONCURRENCY', 3, 12),
+    );
+    const maxAttempts = this.getParallelism('NEAR_AI_PDF_CHUNK_MAX_ATTEMPTS', 3, 6);
+
+    const runChunkExtraction = async (
+      item: { chunk: string; chunkIndex: number },
+      retryAttempts: number,
+    ) => {
+      let attempt = 0;
+      let lastError: unknown = null;
+
+      while (attempt < retryAttempts) {
+        try {
+          const response = await this.createCompletion({
+            model: 'deepseek-ai/DeepSeek-V3.1',
+            messages: [
+              { role: 'system', content: this.buildPDFExtractionPrompt() },
+              {
+                role: 'user',
+                content: this.buildPDFExtractionUserPrompt({
+                  chunk: item.chunk,
+                  chunkIndex: item.chunkIndex,
+                  chunkCount: chunkItems.length,
+                  currency,
+                  metadata: data.metadata,
+                }),
+              },
+            ],
+            max_tokens: 3200,
+            temperature: 0,
+          });
+
+          const text = this.extractResponseText(response) || '{}';
+          const parsed = this.parseJson(text, 'object');
+          const txRows = this.normalizeExtractedChunkTransactions(parsed);
+
+          return {
+            requestId: response.id || null,
+            attestationId: response.tee_attestation?.id || null,
+            transactions: txRows,
+          };
+        } catch (error) {
+          lastError = error;
+          const shouldRetry = this.isRetryableModelError(error);
+          attempt += 1;
+
+          if (!shouldRetry || attempt >= retryAttempts) {
+            throw error;
+          }
+
+          await this.sleep(this.getRetryDelayMs(attempt));
+        }
+      }
+
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('PDF chunk extraction failed with unknown error');
+    };
+
+    const { output: initialChunkResults, errors: initialChunkErrors } = await this.runInBatches(
       chunkItems,
       chunkConcurrency,
-      async (item) => {
-        const response = await this.createCompletion({
-          model: 'deepseek-ai/DeepSeek-V3.1',
-          messages: [
-            { role: 'system', content: this.buildPDFExtractionPrompt() },
-            {
-              role: 'user',
-              content: this.buildPDFExtractionUserPrompt({
-                chunk: item.chunk,
-                chunkIndex: item.chunkIndex,
-                chunkCount: chunks.length,
-                currency,
-                metadata: data.metadata,
-              }),
-            },
-          ],
-          max_tokens: 3200,
-          temperature: 0,
-        });
-
-        const text = this.extractResponseText(response) || '{}';
-        const parsed = this.parseJson(text, 'object');
-        const txRows = this.normalizeExtractedChunkTransactions(parsed);
-
-        return {
-          requestId: response.id || null,
-          attestationId: response.tee_attestation?.id || null,
-          transactions: txRows,
-        };
-      },
+      async (item) => runChunkExtraction(item, maxAttempts),
     );
 
-    if (chunkErrors.length > 0) {
+    let chunkResults = [...initialChunkResults];
+    let remainingErrors = [...initialChunkErrors];
+
+    if (remainingErrors.length > 0) {
+      const failedItems = remainingErrors
+        .map((entry) => chunkItems[entry.index])
+        .filter((entry): entry is { chunk: string; chunkIndex: number } => Boolean(entry));
+
+      if (failedItems.length > 0) {
+        const rescueResults: Array<{
+          requestId: string | null;
+          attestationId: string | null;
+          transactions: ExtractedPDFTransaction[];
+        }> = [];
+        const rescueErrors: Array<{ index: number; error: unknown }> = [];
+
+        for (const failedItem of failedItems) {
+          try {
+            const rescued = await runChunkExtraction(failedItem, Math.max(2, maxAttempts));
+            rescueResults.push(rescued);
+          } catch (error) {
+            rescueErrors.push({
+              index: failedItem.chunkIndex,
+              error,
+            });
+          }
+        }
+
+        chunkResults = [...chunkResults, ...rescueResults];
+        remainingErrors = rescueErrors;
+      }
+    }
+
+    if (remainingErrors.length > 0) {
       console.error('PDF chunk extraction failed for some chunks', {
-        failedChunkCount: chunkErrors.length,
+        failedChunkCount: remainingErrors.length,
       });
     }
 
@@ -385,6 +512,40 @@ export class NEARAIService {
       return fallback;
     }
     return Math.min(Math.max(Math.floor(parsed), 1), max);
+  }
+
+  private sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private getRetryDelayMs(attempt: number) {
+    const base = 350;
+    const jitter = Math.floor(Math.random() * 250);
+    return Math.min(base * 2 ** Math.max(attempt - 1, 0) + jitter, 5_000);
+  }
+
+  private isRetryableModelError(error: unknown) {
+    const status = Number((error as any)?.response?.status);
+    if ([408, 409, 425, 429, 500, 502, 503, 504].includes(status)) {
+      return true;
+    }
+
+    const code = String((error as any)?.code || '').toUpperCase();
+    if (['ECONNABORTED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) {
+      return true;
+    }
+
+    const message = String((error as any)?.message || '').toLowerCase();
+    if (
+      message.includes('timeout') ||
+      message.includes('rate limit') ||
+      message.includes('too many requests') ||
+      message.includes('temporarily unavailable')
+    ) {
+      return true;
+    }
+
+    return false;
   }
 
   private async runInBatches<T, R>(
@@ -519,6 +680,14 @@ export class NEARAIService {
     return 'other';
   }
 
+  private getMaxTransactionAbs() {
+    const parsed = Number(process.env.NEAR_AI_MAX_TRANSACTION_AMOUNT);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.min(parsed, NUMERIC_12_2_MAX_ABS);
+    }
+    return DEFAULT_MAX_TRANSACTION_ABS;
+  }
+
   private normalizeExtractedChunkTransactions(payload: any): ExtractedPDFTransaction[] {
     const rawRows = Array.isArray(payload)
       ? payload
@@ -527,6 +696,7 @@ export class NEARAIService {
       : [];
 
     const normalized: ExtractedPDFTransaction[] = [];
+    const maxTransactionAbs = this.getMaxTransactionAbs();
 
     for (const row of rawRows) {
       const date = this.normalizeLLMDate(row?.date || row?.transactionDate || row?.postedDate);
@@ -541,6 +711,10 @@ export class NEARAIService {
       const confidence = Number.isFinite(confidenceRaw) ? confidenceRaw : undefined;
 
       if (!date || amount === null || Math.abs(amount) < 0.00001) {
+        continue;
+      }
+
+      if (Math.abs(amount) > maxTransactionAbs) {
         continue;
       }
 
@@ -843,7 +1017,7 @@ Each goal object MUST include:
 - monthlyContribution: number in user's preferred currency (>= 0) OR null
 - priority: number (1-5, where 1 is highest)
 
-Output 3-6 goals, highest impact first.`;
+Output 5-8 goals, highest impact first.`;
   }
 
   private buildGoalsUserPrompt(data: any): string {

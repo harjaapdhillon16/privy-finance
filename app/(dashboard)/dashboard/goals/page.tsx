@@ -88,6 +88,7 @@ export default function GoalsPage() {
   const [priority, setPriority] = useState('3');
   const [formError, setFormError] = useState('');
   const [latestPlan, setLatestPlan] = useState<GoalPlanResponse | null>(null);
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isPlanModalOpen, setIsPlanModalOpen] = useState(false);
 
   const { data, isLoading } = useQuery({
@@ -120,6 +121,7 @@ export default function GoalsPage() {
     onSuccess: async (result) => {
       setLatestPlan(result);
       setIsPlanModalOpen(true);
+      setIsCreateModalOpen(false);
       setFormError('');
       await queryClient.invalidateQueries({ queryKey: ['goals'] });
       await queryClient.invalidateQueries({ queryKey: ['insights-all'] });
@@ -207,18 +209,33 @@ export default function GoalsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold text-gray-900">Goals</h1>
-        <p className="mt-1 text-gray-500">
-          Create custom goals and get an AI strategy for exactly how to reach them.
-        </p>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900">Goals</h1>
+          <p className="mt-1 text-gray-500">
+            Create custom goals and get an AI strategy for exactly how to reach them.
+          </p>
+        </div>
+        <Button
+          onClick={() => {
+            setFormError('');
+            setIsCreateModalOpen(true);
+          }}
+        >
+          Create Goal + Generate AI Plan
+        </Button>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Create Goal + Generate AI Plan</CardTitle>
-        </CardHeader>
-        <CardContent>
+      {formError && !isCreateModalOpen ? <p className="text-sm text-red-600">{formError}</p> : null}
+
+      <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Create Goal + Generate AI Plan</DialogTitle>
+            <DialogDescription>
+              Enter your goal details and generate a personalized execution plan.
+            </DialogDescription>
+          </DialogHeader>
           <form className="space-y-4" onSubmit={handleCreateAndPlanGoal}>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div className="space-y-2">
@@ -332,8 +349,8 @@ export default function GoalsPage() {
               Create Goal and Generate Plan
             </Button>
           </form>
-        </CardContent>
-      </Card>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={isPlanModalOpen} onOpenChange={setIsPlanModalOpen}>
         <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">

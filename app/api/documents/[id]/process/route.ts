@@ -13,20 +13,79 @@ import { groupTransactionsByMonth } from '@/lib/utils/transactions';
 
 export const dynamic = 'force-dynamic';
 
+const NUMERIC_12_2_MAX_ABS = 9_999_999_999.99;
+const DEFAULT_MAX_TRANSACTION_ABS = 5_000_000;
+
 function isPdfStatement(file: File) {
   const lower = file.name.toLowerCase();
   return lower.endsWith('.pdf') || file.type.includes('pdf');
+}
+
+function roundMoney(value: number) {
+  return Number(value.toFixed(2));
+}
+
+function clampNumeric12(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  const bounded = Math.min(Math.max(value, -NUMERIC_12_2_MAX_ABS), NUMERIC_12_2_MAX_ABS);
+  return roundMoney(bounded);
+}
+
+function toNullableNumeric12(value: unknown) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return clampNumeric12(parsed);
+}
+
+function getMaxTransactionAbs() {
+  const parsed = Number(process.env.PROCESSING_MAX_TRANSACTION_ABS || process.env.NEAR_AI_MAX_TRANSACTION_AMOUNT);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.min(parsed, NUMERIC_12_2_MAX_ABS);
+  }
+  return DEFAULT_MAX_TRANSACTION_ABS;
+}
+
+function isIsoDate(value: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function sanitizeTransactionsForStorage(transactions: ParsedTransaction[]) {
+  const maxAbs = getMaxTransactionAbs();
+
+  return transactions
+    .map((tx) => ({
+      date: String(tx.date || '').trim(),
+      description: String(tx.description || '').trim(),
+      amount: Number(tx.amount),
+      category: String(tx.category || '').trim() || 'other',
+    }))
+    .filter((tx) => isIsoDate(tx.date))
+    .filter((tx) => tx.description.length > 0)
+    .filter((tx) => Number.isFinite(tx.amount))
+    .filter((tx) => Math.abs(tx.amount) >= 0.01)
+    .filter((tx) => Math.abs(tx.amount) <= maxAbs)
+    .map((tx) => ({
+      ...tx,
+      amount: roundMoney(tx.amount),
+    }));
 }
 
 function buildParseResultFromTransactions(
   transactions: ParsedTransaction[],
   sourceChunks: string[] = [],
 ): ParseResult {
-  if (transactions.length === 0) {
-    throw new Error('No valid transaction rows were found in PDF after LLM extraction');
+  const sanitizedTransactions = sanitizeTransactionsForStorage(transactions);
+
+  if (sanitizedTransactions.length === 0) {
+    throw new Error('No valid transaction rows were found after parsing and sanitization');
   }
 
-  const sorted = [...transactions].sort((a, b) => a.date.localeCompare(b.date));
+  const sorted = [...sanitizedTransactions].sort((a, b) => a.date.localeCompare(b.date));
   let totalIncome = 0;
   let totalExpenses = 0;
 
@@ -40,8 +99,8 @@ function buildParseResultFromTransactions(
 
   return {
     transactions: sorted,
-    totalIncome: Number(totalIncome.toFixed(2)),
-    totalExpenses: Number(totalExpenses.toFixed(2)),
+    totalIncome: clampNumeric12(totalIncome),
+    totalExpenses: clampNumeric12(totalExpenses),
     dateRange: {
       start: sorted[0].date,
       end: sorted[sorted.length - 1].date,
@@ -146,7 +205,14 @@ function buildFallbackGoals(analysis: any) {
   const monthlyIncome = Number(analysis?.cashFlow?.monthlyIncome || 0);
   const monthlyExpenses = Number(analysis?.cashFlow?.monthlyExpenses || 0);
   const monthlySavings = Math.max(monthlyIncome - monthlyExpenses, 0);
-  const emergencyTarget = Math.max(monthlyExpenses * 3, 1000);
+  const annualIncome = Math.max(monthlyIncome * 12, 12_000);
+  const emergencyTarget = Math.max(monthlyExpenses * 3, 3_000);
+  const debtTarget = Math.max(monthlyExpenses * 1.5, 2_000);
+  const investingTarget = Math.max(annualIncome * 0.15, 5_000);
+  const incomeGrowthTarget = Math.max(monthlyIncome * 2, 4_000);
+  const retirementTarget = Math.max(annualIncome * 0.1, 6_000);
+  const conservativeContribution = Math.max(monthlySavings * 0.5, 100);
+  const growthContribution = Math.max(monthlySavings * 0.3, 150);
 
   return [
     {
@@ -156,18 +222,58 @@ function buildFallbackGoals(analysis: any) {
       targetAmount: Number(emergencyTarget.toFixed(2)),
       currentAmount: 0,
       targetDate: null,
-      monthlyContribution: Number(Math.max(monthlySavings * 0.5, 100).toFixed(2)),
+      monthlyContribution: Number(conservativeContribution.toFixed(2)),
       priority: 1,
     },
     {
-      name: 'Increase monthly savings rate',
-      description: 'Automate recurring transfers to consistently increase savings.',
-      category: 'savings',
-      targetAmount: Number(Math.max(monthlyIncome * 0.2 * 12, 2000).toFixed(2)),
+      name: 'Pay down high-interest debt',
+      description: 'Reduce interest costs by aggressively targeting the highest-rate debt first.',
+      category: 'debt',
+      targetAmount: Number(debtTarget.toFixed(2)),
       currentAmount: 0,
       targetDate: null,
-      monthlyContribution: Number(Math.max(monthlySavings, 150).toFixed(2)),
+      monthlyContribution: Number(Math.max(growthContribution, 150).toFixed(2)),
       priority: 2,
+    },
+    {
+      name: 'Increase monthly savings rate',
+      description: 'Automate recurring transfers to consistently increase monthly savings.',
+      category: 'savings',
+      targetAmount: Number(Math.max(annualIncome * 0.2, 4_000).toFixed(2)),
+      currentAmount: 0,
+      targetDate: null,
+      monthlyContribution: Number(Math.max(monthlySavings, 200).toFixed(2)),
+      priority: 3,
+    },
+    {
+      name: 'Build long-term investment base',
+      description: 'Contribute monthly to a diversified portfolio aligned with your risk profile.',
+      category: 'investing',
+      targetAmount: Number(investingTarget.toFixed(2)),
+      currentAmount: 0,
+      targetDate: null,
+      monthlyContribution: Number(Math.max(growthContribution, 250).toFixed(2)),
+      priority: 4,
+    },
+    {
+      name: 'Grow primary income capacity',
+      description: 'Invest in skills, certifications, or side income channels to raise earnings.',
+      category: 'income',
+      targetAmount: Number(incomeGrowthTarget.toFixed(2)),
+      currentAmount: 0,
+      targetDate: null,
+      monthlyContribution: Number(Math.max(conservativeContribution, 120).toFixed(2)),
+      priority: 5,
+    },
+    {
+      name: 'Increase retirement contributions',
+      description: 'Set up a consistent retirement contribution to compound long-term wealth.',
+      category: 'retirement',
+      targetAmount: Number(retirementTarget.toFixed(2)),
+      currentAmount: 0,
+      targetDate: null,
+      monthlyContribution: Number(Math.max(growthContribution, 200).toFixed(2)),
+      priority: 5,
     },
   ];
 }
@@ -244,7 +350,14 @@ function normalizeStoredTransactions(input: unknown): StoredTransaction[] {
           ? undefined
           : String(item.source_document_id).trim() || undefined,
     }))
-    .filter((item) => item.date && item.description && Number.isFinite(item.amount));
+    .filter((item) => item.date && item.description && Number.isFinite(item.amount))
+    .filter((item) => isIsoDate(item.date))
+    .filter((item) => Math.abs(item.amount) >= 0.01)
+    .filter((item) => Math.abs(item.amount) <= getMaxTransactionAbs())
+    .map((item) => ({
+      ...item,
+      amount: roundMoney(item.amount),
+    }));
 }
 
 function buildTransactionsByMonth(
@@ -417,29 +530,53 @@ export async function POST(
           'No readable text extracted from PDF. Upload a searchable PDF or export CSV/XLSX for best results.',
         );
       }
-      const llmExtracted = await nearAI.extractTransactionsFromPDFChunks({
-        chunks: sourceChunks,
-        currency: extractionCurrency,
-        metadata: {
-          fileName: document.file_name,
-          accountName: document.account_name,
-          statementPeriodStart: document.statement_period_start,
-          statementPeriodEnd: document.statement_period_end,
-          documentType: document.document_type,
-        },
-      });
+      let llmTransactions: ParsedTransaction[] = [];
 
-      parseResult = buildParseResultFromTransactions(
-        llmExtracted.transactions.map((tx) => ({
+      try {
+        const llmExtracted = await nearAI.extractTransactionsFromPDFChunks({
+          chunks: sourceChunks,
+          currency: extractionCurrency,
+          metadata: {
+            fileName: document.file_name,
+            accountName: document.account_name,
+            statementPeriodStart: document.statement_period_start,
+            statementPeriodEnd: document.statement_period_end,
+            documentType: document.document_type,
+          },
+        });
+
+        llmTransactions = llmExtracted.transactions.map((tx) => ({
           date: tx.date,
           description: tx.description,
           amount: Number(tx.amount),
           category: tx.category || (tx.amount > 0 ? 'income_other' : 'other'),
-        })),
-        sourceChunks,
-      );
+        }));
+      } catch (llmExtractionError) {
+        console.error('LLM PDF extraction failed, falling back to deterministic parser', llmExtractionError);
+      }
+
+      if (llmTransactions.length > 0) {
+        parseResult = buildParseResultFromTransactions(llmTransactions, sourceChunks);
+      } else {
+        try {
+          const fallbackParsed = await parseBankStatement(file);
+          parseResult = buildParseResultFromTransactions(
+            fallbackParsed.transactions,
+            fallbackParsed.sourceChunks && fallbackParsed.sourceChunks.length > 0
+              ? fallbackParsed.sourceChunks
+              : sourceChunks,
+          );
+        } catch (fallbackError: any) {
+          throw new Error(
+            `No valid transaction rows were found in PDF after LLM extraction and fallback parsing. ${
+              fallbackError?.message || ''
+            }`.trim(),
+          );
+        }
+      }
     } else {
       parseResult = await parseBankStatement(file);
+      parseResult = buildParseResultFromTransactions(parseResult.transactions, parseResult.sourceChunks || []);
     }
 
     const monthlySummaries = groupTransactionsByMonth(parseResult.transactions);
@@ -486,15 +623,16 @@ export async function POST(
         user_id: document.user_id,
         document_id: documentId,
         summary_month: month,
-        total_income: recalculatedSummary.total_income,
+        total_income: clampNumeric12(recalculatedSummary.total_income),
         income_count: recalculatedSummary.income_count,
         income_by_source: recalculatedSummary.income_by_source,
-        total_expenses: recalculatedSummary.total_expenses,
+        total_expenses: clampNumeric12(recalculatedSummary.total_expenses),
         expense_count: recalculatedSummary.expense_count,
         expenses_by_category: recalculatedSummary.expenses_by_category,
         top_merchants: recalculatedSummary.top_merchants,
         all_transactions: mergedTransactions,
       };
+      return mergedRow;
     });
 
     await Promise.all(
@@ -637,8 +775,8 @@ export async function POST(
       category: insight.category || 'cashflow',
       title: insight.title || 'Financial optimization recommendation',
       description: insight.description || 'Review this recommendation to improve your finances.',
-      potential_savings: insight.potentialSavings || null,
-      potential_earnings: insight.potentialEarnings || null,
+      potential_savings: toNullableNumeric12(insight.potentialSavings),
+      potential_earnings: toNullableNumeric12(insight.potentialEarnings),
       impact_level: insight.impactLevel || 'medium',
       action_required: Array.isArray(insight.actionSteps)
         ? insight.actionSteps.join('\n')
@@ -660,10 +798,14 @@ export async function POST(
 
     if (existingGoalsError) throw existingGoalsError;
 
+    const minimumTotalGoalCount = 5;
+    const minimumNewGoalsNeeded = Math.max(minimumTotalGoalCount - (existingGoals || []).length, 0);
+    const llmGoalCandidates = Array.isArray(goalsResult.goals) ? goalsResult.goals : [];
+    const goalCandidates = [...llmGoalCandidates, ...buildFallbackGoals(aiResult.analysis)];
     const seenGoalNames = new Set((existingGoals || []).map((goal: any) => normalizeGoalName(goal.name || '')));
     const goalsToInsert: any[] = [];
 
-    for (const rawGoal of goalsResult.goals || []) {
+    for (const rawGoal of goalCandidates) {
       const name = String(rawGoal?.name || '')
         .trim()
         .slice(0, 80);
@@ -672,10 +814,14 @@ export async function POST(
       const normalizedName = normalizeGoalName(name);
       if (seenGoalNames.has(normalizedName)) continue;
 
-      const targetAmount = toNonNegativeNumber(rawGoal?.targetAmount ?? rawGoal?.target_amount, 0);
+      const targetAmount = clampNumeric12(
+        toNonNegativeNumber(rawGoal?.targetAmount ?? rawGoal?.target_amount, 0),
+      );
       if (targetAmount <= 0) continue;
 
-      const currentAmountRaw = toNonNegativeNumber(rawGoal?.currentAmount ?? rawGoal?.current_amount, 0);
+      const currentAmountRaw = clampNumeric12(
+        toNonNegativeNumber(rawGoal?.currentAmount ?? rawGoal?.current_amount, 0),
+      );
       const currentAmount = Math.min(currentAmountRaw, targetAmount);
 
       const description = String(rawGoal?.description || '')
@@ -687,7 +833,7 @@ export async function POST(
       const monthlyContribution =
         monthlyContributionRaw === null || monthlyContributionRaw === undefined
           ? null
-          : toNonNegativeNumber(monthlyContributionRaw, 0);
+          : clampNumeric12(toNonNegativeNumber(monthlyContributionRaw, 0));
 
       const parsedPriority = Math.round(Number(rawGoal?.priority));
       const priority = Number.isFinite(parsedPriority)
@@ -712,6 +858,14 @@ export async function POST(
       if (goalsToInsert.length >= 6) break;
     }
 
+    if (goalsToInsert.length < minimumNewGoalsNeeded) {
+      console.warn('Goal generation produced fewer unique goals than expected minimum', {
+        existingGoalCount: (existingGoals || []).length,
+        minimumNewGoalsNeeded,
+        insertedGoals: goalsToInsert.length,
+      });
+    }
+
     if (goalsToInsert.length > 0) {
       const { error: goalsInsertError } = await adminSupabase.from('goals').insert(goalsToInsert);
       if (goalsInsertError) throw goalsInsertError;
@@ -725,8 +879,8 @@ export async function POST(
         transaction_count: parseResult.transactions.length,
         date_range_start: parseResult.dateRange.start,
         date_range_end: parseResult.dateRange.end,
-        total_income: parseResult.totalIncome,
-        total_expenses: parseResult.totalExpenses,
+        total_income: clampNumeric12(parseResult.totalIncome),
+        total_expenses: clampNumeric12(parseResult.totalExpenses),
       })
       .eq('id', documentId);
 
