@@ -8,7 +8,7 @@ export default function LandingPage() {
     <div className="min-h-screen bg-gray-50">
       {/* Top Banner */}
       <div className="bg-blue-600 text-white text-center py-2.5 text-sm font-medium">
-        ✨ Season 2024 • Early-bird registration now open →
+        ✨ Use Nova SDK and NEAR Private AI
       </div>
 
       {/* Navigation */}
