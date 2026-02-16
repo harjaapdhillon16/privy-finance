@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - NOVA_API_KEY=${NOVA_API_KEY}
+      - NOVA_ACCOUNT_ID=${NOVA_ACCOUNT_ID}
+      - NOVA_GROUP_PREFIX=${NOVA_GROUP_PREFIX}
+      - NEAR_AI_API_KEY=${NEAR_AI_API_KEY}
+      - NEXT_PUBLIC_NEAR_NETWORK=mainnet
+    restart: unless-stopped

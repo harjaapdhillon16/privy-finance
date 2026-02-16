@@ -1,0 +1,17 @@
+{
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "regions": ["iad1"],
+  "env": {
+    "NEXT_PUBLIC_SUPABASE_URL": "@supabase-url",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "@supabase-anon-key",
+    "SUPABASE_SERVICE_ROLE_KEY": "@supabase-service-key",
+    "NOVA_API_KEY": "@nova-api-key",
+    "NOVA_ACCOUNT_ID": "@nova-account-id",
+    "NOVA_GROUP_PREFIX": "privy-finance",
+    "NEAR_AI_API_KEY": "@near-ai-key",
+    "NEXT_PUBLIC_NEAR_NETWORK": "mainnet"
+  }
+}
